@@ -1,20 +1,10 @@
 """
-Facial Recognition Attendance System — Streamlit GUI  (FIXED)
+Facial Recognition Attendance System — Streamlit GUI (Streamlit Cloud / webrtc version)
 Requires: attendance_system.py in the same directory
 Run     : streamlit run app.py
 """
-import sys
-import streamlit as st
 
-st.write("Python:", sys.executable)
-
-try:
-    import openpyxl
-    st.write("openpyxl OK:", openpyxl.__version__)
-except Exception as e:
-    st.error(f"openpyxl import failed: {e}")
-
-import os, cv2, pickle, warnings, glob, time
+import os, cv2, pickle, warnings, glob, time, threading
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -24,13 +14,21 @@ from PIL import Image
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 warnings.filterwarnings("ignore")
 
-# ── Page config ───────────────────────────────────────────────
+# ── Page config  (MUST be first st call) ─────────────────────
 st.set_page_config(
     page_title="Smart Attendance System",
     page_icon="🎓",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ── Import webrtc ─────────────────────────────────────────────
+try:
+    from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+    import av
+    WEBRTC_OK = True
+except ImportError:
+    WEBRTC_OK = False
 
 # ── Import backend ────────────────────────────────────────────
 try:
@@ -49,6 +47,11 @@ except ImportError as _e:
 if BACKEND_OK:
     for p in DIRS.values():
         os.makedirs(p, exist_ok=True)
+
+# ── RTC config (STUN server — required on Streamlit Cloud) ────
+RTC_CONFIG = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
 
 # ══════════════════════════════════════════════════════════════
 #  CSS STYLING
@@ -117,17 +120,140 @@ def img_count(name, sid):
 def attendance_files():
     return sorted(glob.glob(os.path.join(DIRS["attendance"], "*.xlsx")))
 
-def open_camera_st():
-    """Open camera and configure it."""
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        # Try index 1 if 0 fails
-        cap = cv2.VideoCapture(1)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return cap
+# ══════════════════════════════════════════════════════════════
+#  VIDEO PROCESSORS (streamlit-webrtc)
+# ══════════════════════════════════════════════════════════════
+
+class RegisterProcessor(VideoProcessorBase):
+    """Captures face frames for student registration."""
+    def __init__(self):
+        self.lock         = threading.Lock()
+        self.capturing    = False
+        self.saved        = 0
+        self.student_dir  = ""
+        self.target       = CAPTURE_FRAMES if BACKEND_OK else 30
+        self._haar        = get_haar() if BACKEND_OK else None
+
+    def recv(self, frame: "av.VideoFrame") -> "av.VideoFrame":
+        img = frame.to_ndarray(format="bgr24")
+        img = cv2.flip(img, 1)
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        cv2.equalizeHist(gray, gray)
+        faces = detect_faces(gray, self._haar) if BACKEND_OK else []
+
+        with self.lock:
+            capturing   = self.capturing
+            saved       = self.saved
+            student_dir = self.student_dir
+            target      = self.target
+
+        if capturing and student_dir and faces is not None and len(faces) > 0 and saved < target:
+            x, y, w, h = faces[0]
+            face_crop   = img[y:y+h, x:x+w]
+            path        = os.path.join(student_dir, f"{saved}.jpg")
+            cv2.imwrite(path, face_crop)
+            with self.lock:
+                self.saved += 1
+                saved = self.saved
+
+        # Draw overlay
+        for (x, y, w, h) in (faces if faces is not None else []):
+            if capturing:
+                label = f"Saving {saved}/{target}"
+                color = (0, 255, 0)
+            else:
+                label = "Face Detected ✓"
+                color = (0, 220, 220)
+            if BACKEND_OK:
+                draw_box(img, x, y, w, h, label, color)
+            else:
+                cv2.rectangle(img, (x, y), (x+w, y+h), color, 2)
+                cv2.putText(img, label, (x, y-8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        status = f"Captured {saved}/{target}" if capturing else "Preview — position your face"
+        cv2.putText(img, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+
+class AttendanceProcessor(VideoProcessorBase):
+    """Runs live face recognition for attendance marking."""
+    def __init__(self):
+        self.lock        = threading.Lock()
+        self.enc_db      = load_encodings()
+        self.marked      = set()   # set of student IDs already marked
+        self.log         = []      # list of [id, name, time, date, status]
+        self._haar       = get_haar() if BACKEND_OK else None
+        self._frame_no   = 0
+        self._threshold  = THRESHOLD if BACKEND_OK else 0.4
+
+    def recv(self, frame: "av.VideoFrame") -> "av.VideoFrame":
+        img = frame.to_ndarray(format="bgr24")
+        img = cv2.flip(img, 1)
+
+        self._frame_no += 1
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        cv2.equalizeHist(gray, gray)
+        faces = detect_faces(gray, self._haar) if BACKEND_OK else []
+
+        for (x, y, w, h) in (faces if faces is not None else []):
+            # Only run heavy recognition every 5 frames
+            if self._frame_no % 5 != 0:
+                if BACKEND_OK:
+                    draw_box(img, x, y, w, h, "scanning…", (120, 120, 120))
+                continue
+
+            fc = img[y:y+h, x:x+w]
+            if fc.size == 0:
+                continue
+
+            try:
+                enc = get_embedding(fc) if BACKEND_OK else None
+                if enc is None:
+                    if BACKEND_OK:
+                        draw_box(img, x, y, w, h, "?", (80, 80, 200))
+                    continue
+
+                best_id, best_dist, best_name = None, 1.0, "Unknown"
+                for s_id, data in self.enc_db.items():
+                    dists = [cosine(enc, e) for e in data["encodings"]]
+                    avg   = float(np.mean(sorted(dists)[:5]))
+                    if avg < best_dist:
+                        best_dist = avg
+                        best_id   = s_id
+                        best_name = data["name"]
+
+                with self.lock:
+                    already = best_id in self.marked
+
+                if best_dist < self._threshold:
+                    color = (0, 180, 60) if not already else (200, 140, 0)
+                    label = f"{best_name} {'(marked)' if already else 'PRESENT'}"
+                    if BACKEND_OK:
+                        draw_box(img, x, y, w, h, label, color)
+                    if not already:
+                        now = datetime.now().strftime("%H:%M:%S")
+                        date = datetime.now().strftime("%Y-%m-%d")
+                        with self.lock:
+                            self.marked.add(best_id)
+                            self.log.append([best_id, best_name, now, date, "Present"])
+                else:
+                    if BACKEND_OK:
+                        draw_box(img, x, y, w, h, f"Unknown ({best_dist:.2f})", (60, 60, 200))
+
+            except Exception:
+                if BACKEND_OK:
+                    draw_box(img, x, y, w, h, "error", (0, 0, 180))
+
+        with self.lock:
+            count = len(self.marked)
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        cv2.putText(img, f"{date_str}  Marked: {count}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
 
 # ══════════════════════════════════════════════════════════════
 #  SIDEBAR
@@ -143,21 +269,26 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    df_stu = load_students()
-    enc_db = load_encodings()
-    df_att = load_attendance_all()
+    df_stu  = load_students()
+    enc_db  = load_encodings()
+    df_att  = load_attendance_all()
 
     col1, col2 = st.columns(2)
     col1.metric("Students", len(df_stu))
-    col2.metric("Records", len(df_att))
+    col2.metric("Records",  len(df_att))
     model_status = f"✅ {len(enc_db)} enrolled" if enc_db else "❌ Not trained"
     st.metric("Model", model_status)
     st.markdown('<p class="sidebar-footer">Powered by DeepFace • Facenet</p>', unsafe_allow_html=True)
 
-# ── Backend guard ─────────────────────────────────────────────
-if not BACKEND_OK:
-    st.error(f"❌ Could not import `attendance_system.py`. Make sure it is in the same folder.\n\nError: `{BACKEND_ERR}`")
+# ── Guards ────────────────────────────────────────────────────
+if not WEBRTC_OK:
+    st.error("❌ `streamlit-webrtc` not installed. Add it to requirements.txt")
     st.stop()
+
+if not BACKEND_OK:
+    st.error(f"❌ Could not import `attendance_system.py`.\n\nError: `{BACKEND_ERR}`")
+    st.stop()
+
 
 # ══════════════════════════════════════════════════════════════
 #  PAGE: DASHBOARD
@@ -168,9 +299,9 @@ if page == "📊 Dashboard":
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("👥 Enrolled Students", len(df_stu))
-    c2.metric("🧠 Model Status", "Trained" if enc_db else "Untrained")
-    c3.metric("📋 Total Records", len(df_att))
-    c4.metric("📁 Attendance Files", len(attendance_files()))
+    c2.metric("🧠 Model Status",      "Trained" if enc_db else "Untrained")
+    c3.metric("📋 Total Records",     len(df_att))
+    c4.metric("📁 Attendance Files",  len(attendance_files()))
 
     st.markdown("---")
     col_left, col_right = st.columns(2)
@@ -192,210 +323,109 @@ if page == "📊 Dashboard":
             recent = df_att.sort_values("Date", ascending=False).head(15)
             st.dataframe(recent, use_container_width=True, hide_index=True, height=400)
 
+
 # ══════════════════════════════════════════════════════════════
-#  PAGE: REGISTER  ← MAIN FIX IS HERE
+#  PAGE: REGISTER
 # ══════════════════════════════════════════════════════════════
 elif page == "👤 Register":
     st.markdown('<p class="section-title">Register Student</p>', unsafe_allow_html=True)
     st.markdown('<p class="section-sub">Capture facial data and enroll new students</p>', unsafe_allow_html=True)
 
-    # ── Session state keys for registration ──────────────────
-    for key, default in [
-        ("reg_phase", "idle"),       # idle | preview | capturing | done
-        ("reg_saved", 0),
-        ("reg_cap", None),
-        ("reg_haar", None),
-        ("reg_student_dir", ""),
-        ("reg_sid", ""),
-        ("reg_name", ""),
-    ]:
-        if key not in st.session_state:
-            st.session_state[key] = default
-
     col_form, col_info = st.columns([1, 1])
 
     with col_form:
-        # Show form only when not actively capturing
-        if st.session_state.reg_phase == "idle":
-            sid  = st.text_input("🆔 Student ID (numeric)", placeholder="e.g. 1001")
-            name = st.text_input("📝 Student Name", placeholder="e.g. John Doe")
+        sid  = st.text_input("🆔 Student ID (numeric)", placeholder="e.g. 1001")
+        name = st.text_input("📝 Student Name",         placeholder="e.g. John Doe")
 
-            if st.button("📸 Open Camera & Preview", type="primary", use_container_width=True):
-                if not sid.strip().isdigit():
-                    st.error("❌ Student ID must be numeric.")
-                elif not name.strip():
-                    st.error("❌ Name cannot be empty.")
+        if sid and name:
+            student_dir = os.path.join(DIRS["images"], f"{name.strip()}_{sid.strip()}")
+            os.makedirs(student_dir, exist_ok=True)
+        else:
+            student_dir = ""
+
+        st.markdown("---")
+        st.markdown("**Step 1 — Allow camera access, then position your face**")
+        st.markdown("**Step 2 — Click *Start Capturing* below**")
+
+        ctx = webrtc_streamer(
+            key="register",
+            video_processor_factory=RegisterProcessor,
+            rtc_configuration=RTC_CONFIG,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
+
+        # Wire student_dir into the processor as soon as it exists
+        if ctx.video_processor and student_dir:
+            ctx.video_processor.student_dir = student_dir
+
+        # Controls
+        col_a, col_b = st.columns(2)
+        start_btn  = col_a.button("🟢 Start Capturing", type="primary", use_container_width=True)
+        stop_btn   = col_b.button("⏹ Stop",              use_container_width=True)
+
+        if start_btn:
+            if not sid.strip().isdigit():
+                st.error("❌ Student ID must be numeric.")
+            elif not name.strip():
+                st.error("❌ Name cannot be empty.")
+            elif ctx.video_processor:
+                ctx.video_processor.capturing = True
+                ctx.video_processor.saved     = 0
+                st.info("🟢 Capturing started — hold still!")
+            else:
+                st.warning("⚠️ Camera not ready yet. Wait for the stream to start.")
+
+        if stop_btn and ctx.video_processor:
+            ctx.video_processor.capturing = False
+
+        # Live progress
+        if ctx.video_processor:
+            saved  = ctx.video_processor.saved
+            target = ctx.video_processor.target
+            st.progress(min(saved / target, 1.0))
+            st.caption(f"Frames captured: {saved} / {target}")
+
+            if saved >= target and student_dir:
+                # Auto-save student to CSV
+                new_row = pd.DataFrame(
+                    [[int(sid.strip()), name.strip(), datetime.now().strftime("%Y-%m-%d %H:%M")]],
+                    columns=["ID", "Name", "Registered"],
+                )
+                if os.path.exists(STUDENTS_CSV):
+                    df_existing = pd.read_csv(STUDENTS_CSV)
+                    df_existing = df_existing[df_existing["ID"] != int(sid.strip())]
+                    df_existing = pd.concat([df_existing, new_row], ignore_index=True)
                 else:
-                    student_dir = os.path.join(DIRS["images"], f"{name.strip()}_{sid.strip()}")
-                    os.makedirs(student_dir, exist_ok=True)
+                    df_existing = new_row
+                df_existing.to_csv(STUDENTS_CSV, index=False)
 
-                    cap = open_camera_st()
-                    if not cap.isOpened():
-                        st.error("❌ Cannot open camera. Check your camera connection and try again.")
-                    else:
-                        # Warmup
-                        for _ in range(30):
-                            cap.read()
-                        st.session_state.reg_cap         = cap
-                        st.session_state.reg_haar        = get_haar()
-                        st.session_state.reg_phase       = "preview"
-                        st.session_state.reg_saved       = 0
-                        st.session_state.reg_student_dir = student_dir
-                        st.session_state.reg_sid         = sid.strip()
-                        st.session_state.reg_name        = name.strip()
-                        st.rerun()
-
-        # ── Preview phase: show live feed, user clicks Start ──
-        if st.session_state.reg_phase in ("preview", "capturing", "done"):
-            cap  = st.session_state.reg_cap
-            haar = st.session_state.reg_haar
-
-            cam_placeholder = st.empty()
-            status_text     = st.empty()
-            progress_bar    = st.empty()
-
-            btn_col1, btn_col2 = st.columns(2)
-
-            if st.session_state.reg_phase == "preview":
-                start_clicked = btn_col1.button("🟢 Start Capturing", type="primary", use_container_width=True)
-                cancel_clicked = btn_col2.button("❌ Cancel", use_container_width=True)
-
-                if cancel_clicked:
-                    if cap:
-                        cap.release()
-                    st.session_state.reg_phase = "idle"
-                    st.session_state.reg_cap   = None
-                    st.rerun()
-
-                if start_clicked:
-                    st.session_state.reg_phase = "capturing"
-                    st.session_state.reg_saved = 0
-                    st.rerun()
-
-                # Show live preview frame
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    frame = cv2.flip(frame, 1)
-                    gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    cv2.equalizeHist(gray, gray)
-                    faces = detect_faces(gray, haar)
-
-                    if faces is None or len(faces) == 0:
-                        hud(frame, "No face detected — adjust position", color=(0, 100, 220))
-                    else:
-                        for (x, y, w, h) in faces:
-                            draw_box(frame, x, y, w, h, "Face Detected ✓", (0, 220, 220))
-                        hud(frame, f"{len(faces)} face(s) detected — click Start Capturing")
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    cam_placeholder.image(rgb, channels="RGB", use_container_width=True)
-                    status_text.info(f"👁️ Preview active — **{len(faces)} face(s)** detected. Click **Start Capturing** when ready.")
-
-                # Auto-refresh preview
-                time.sleep(0.05)
-                st.rerun()
-
-            elif st.session_state.reg_phase == "capturing":
-                stop_clicked = btn_col1.button("⏹ Stop Early", use_container_width=True)
-                saved = st.session_state.reg_saved
-                student_dir = st.session_state.reg_student_dir
-
-                # Capture one frame per Streamlit rerun
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    frame = cv2.flip(frame, 1)
-                    gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    cv2.equalizeHist(gray, gray)
-                    faces = detect_faces(gray, haar)
-
-                    for (x, y, w, h) in faces:
-                        draw_box(frame, x, y, w, h,
-                                 f"Capturing {saved+1}/{CAPTURE_FRAMES}", (0, 255, 0))
-
-                    # Save frame to disk
-                    save_path = os.path.join(student_dir, f"{saved}.jpg")
-                    if faces is not None and len(faces) > 0:
-                        x, y, w, h = faces[0]   # take first face
-                        face_crop = frame[y:y+h, x:x+w]
-                        cv2.imwrite(save_path, face_crop)
-                    st.session_state.reg_saved += 1
-                    saved = st.session_state.reg_saved
-
-                    hud(frame, f"Capturing {saved}/{CAPTURE_FRAMES} — hold still!", color=(0, 200, 80))
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    cam_placeholder.image(rgb, channels="RGB", use_container_width=True)
-                    progress_bar.progress(min(saved / CAPTURE_FRAMES, 1.0))
-                    status_text.success(f"🟢 Capturing... **{saved}/{CAPTURE_FRAMES}** frames saved")
-
-                if stop_clicked or st.session_state.reg_saved >= CAPTURE_FRAMES:
-                    st.session_state.reg_phase = "done"
-                    st.rerun()
-                else:
-                    time.sleep(0.05)
-                    st.rerun()
-
-            elif st.session_state.reg_phase == "done":
-                # Release camera
-                if cap:
-                    cap.release()
-                    st.session_state.reg_cap = None
-
-                saved       = st.session_state.reg_saved
-                sid         = st.session_state.reg_sid
-                name        = st.session_state.reg_name
-                student_dir = st.session_state.reg_student_dir
-
-                cam_placeholder.empty()
-                progress_bar.empty()
-
-                if saved < 5:
-                    st.error(f"⚠️ Only {saved} frames captured. Please try again.")
-                else:
-                    # Save to CSV
-                    new_row = pd.DataFrame(
-                        [[int(sid), name, datetime.now().strftime("%Y-%m-%d %H:%M")]],
-                        columns=["ID", "Name", "Registered"],
-                    )
-                    if os.path.exists(STUDENTS_CSV):
-                        df = pd.read_csv(STUDENTS_CSV)
-                        df = df[df["ID"] != int(sid)]
-                        df = pd.concat([df, new_row], ignore_index=True)
-                    else:
-                        df = new_row
-                    df.to_csv(STUDENTS_CSV, index=False)
-
-                    st.success(f"✅ **{name}** registered successfully! ({saved} frames saved)")
-                    st.info(f"📁 Images saved to: `{student_dir}`")
-                    st.info("➡️ Go to **🧠 Train Model** next to generate embeddings.")
-
-                if st.button("🔄 Register Another Student", use_container_width=True):
-                    st.session_state.reg_phase = "idle"
-                    st.rerun()
+                st.success(f"✅ **{name.strip()}** registered! ({saved} frames saved)")
+                st.info("➡️ Go to **🧠 Train Model** to generate embeddings.")
+                ctx.video_processor.capturing = False
 
     with col_info:
         st.markdown("### 📋 Instructions")
         st.markdown("""
-        **Registration Steps:**
-        1. Enter student ID (must be numeric)
-        2. Enter student name
-        3. Click **Open Camera & Preview**
-        4. Position face in the camera frame
-        5. Click **Start Capturing** (no keyboard needed!)
-        6. Hold still while frames are captured automatically
-        7. Registration completes automatically at 30 frames
+**Registration Steps:**
+1. Enter Student ID (numeric) and Name
+2. Click **Start** on the camera widget (allow browser camera access)
+3. Click **Start Capturing** once your face is visible
+4. Hold still — frames are captured automatically
+5. Registration saves when target frames are reached
 
-        **Tips for Best Results:**
-        - Ensure good lighting
-        - Face the camera directly
-        - Stay still during capture
-        - Remove glasses if possible
+**Tips for Best Results:**
+- Ensure good lighting
+- Face the camera directly
+- Stay still during capture
+- Remove glasses if possible
         """)
-
         if not df_stu.empty:
             st.markdown("### 👥 Recently Registered")
-            recent_students = df_stu.sort_values("Registered", ascending=False).head(5)
-            for _, row in recent_students.iterrows():
+            for _, row in df_stu.sort_values("Registered", ascending=False).head(5).iterrows():
                 st.markdown(f"**{row['Name']}** (ID: {row['ID']})")
                 st.caption(f"Registered: {row['Registered']}")
+
 
 # ══════════════════════════════════════════════════════════════
 #  PAGE: TRAIN
@@ -424,14 +454,14 @@ elif page == "🧠 Train Model":
     st.markdown("---")
 
     if st.button("🚀 Start Training", type="primary", use_container_width=True):
-        with st.spinner("🔄 Training model... This may take a few minutes on first run (downloads ~90MB model)..."):
+        with st.spinner("🔄 Training model... First run downloads ~90 MB Facenet model..."):
             progress_bar = st.progress(0)
             status_text  = st.empty()
             log_area     = st.empty()
             logs = []
 
-            encodings_db   = {}
-            total_folders  = len(folders)
+            encodings_db  = {}
+            total_folders = len(folders)
 
             for idx, folder in enumerate(folders):
                 parts = folder.rsplit("_", 1)
@@ -488,19 +518,20 @@ elif page == "🧠 Train Model":
 
                 st.success("✅ **Training Complete!**")
                 col_a, col_b = st.columns(2)
-                col_a.metric("📊 Students Trained", len(encodings_db))
-                col_b.metric("🎯 Total Embeddings", total_embeddings)
+                col_a.metric("📊 Students Trained",  len(encodings_db))
+                col_b.metric("🎯 Total Embeddings",  total_embeddings)
                 st.balloons()
 
     st.markdown("---")
     st.markdown("""
-    **What happens during training?**
-    Face detection on registered images → Facenet embeddings (128-D) → saved for live recognition.
-    Retrain after registering new students. First run downloads Facenet model (~90 MB).
+**What happens during training?**
+Face detection on registered images → Facenet embeddings (128-D) → saved for live recognition.
+Retrain after registering new students. First run downloads Facenet model (~90 MB).
     """)
 
+
 # ══════════════════════════════════════════════════════════════
-#  PAGE: ATTENDANCE  ← ALSO FIXED (no cv2.imshow/waitKey)
+#  PAGE: ATTENDANCE
 # ══════════════════════════════════════════════════════════════
 elif page == "📋 Attendance":
     st.markdown('<p class="section-title">Mark Attendance</p>', unsafe_allow_html=True)
@@ -510,156 +541,61 @@ elif page == "📋 Attendance":
         st.error("❌ No trained model found. Please train the model first.")
         st.stop()
 
-    # Session state
-    for key, default in [
-        ("att_running", False),
-        ("att_log", []),
-        ("att_marked", set()),
-        ("att_cap", None),
-        ("att_frame_count", 0),
-    ]:
-        if key not in st.session_state:
-            st.session_state[key] = default
-
     col_cam, col_log = st.columns([3, 2])
 
     with col_cam:
-        cam_placeholder  = st.empty()
-        info_placeholder = st.empty()
+        st.markdown("**Allow camera access and click Start ▶**")
+        ctx = webrtc_streamer(
+            key="attendance",
+            video_processor_factory=AttendanceProcessor,
+            rtc_configuration=RTC_CONFIG,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
 
     with col_log:
         st.subheader("✅ Attendance Log")
         log_placeholder   = st.empty()
         count_placeholder = st.empty()
+        save_placeholder  = st.empty()
 
-    btn_col1, btn_col2, _ = st.columns([1, 1, 3])
+    # Poll the processor state every refresh
+    if ctx.video_processor:
+        with ctx.video_processor.lock:
+            log_snapshot    = list(ctx.video_processor.log)
+            marked_count    = len(ctx.video_processor.marked)
 
-    start_btn = btn_col1.button("▶ Start Recognition", type="primary", use_container_width=True)
-    stop_btn  = btn_col2.button("⏹ Stop & Save",       use_container_width=True)
+        if log_snapshot:
+            df_live = pd.DataFrame(log_snapshot, columns=["ID", "Name", "Time", "Date", "Status"])
+            log_placeholder.dataframe(
+                df_live[["Name", "Time"]], use_container_width=True, hide_index=True, height=400
+            )
+            count_placeholder.success(f"**{marked_count} student(s) marked present**")
 
-    if start_btn and not st.session_state.att_running:
-        cap = open_camera_st()
-        if not cap.isOpened():
-            st.error("❌ Cannot open camera.")
-        else:
-            for _ in range(30): cap.read()   # warmup
-            st.session_state.att_cap         = cap
-            st.session_state.att_running     = True
-            st.session_state.att_log         = []
-            st.session_state.att_marked      = set()
-            st.session_state.att_frame_count = 0
-            st.rerun()
+            # Save button
+            if save_placeholder.button("💾 Save Attendance to Excel", type="primary"):
+                session_date = datetime.now().strftime("%Y-%m-%d")
+                excel_path   = os.path.join(DIRS["attendance"], f"Attendance_{session_date}.xlsx")
+                df_save = pd.DataFrame(log_snapshot, columns=["ID", "Name", "Time", "Date", "Status"])
+                mode = "a" if os.path.exists(excel_path) else "w"
+                kw   = {"if_sheet_exists": "replace"} if mode == "a" else {}
+                with pd.ExcelWriter(excel_path, engine="openpyxl", mode=mode, **kw) as writer:
+                    df_save.to_excel(writer, sheet_name=session_date, index=False)
+                st.success(f"✅ Saved → `{excel_path}`")
 
-    if stop_btn and st.session_state.att_running:
-        st.session_state.att_running = False
-        if st.session_state.att_cap:
-            st.session_state.att_cap.release()
-            st.session_state.att_cap = None
-        st.rerun()
-
-    if st.session_state.att_running:
-        cap  = st.session_state.att_cap
-        haar = get_haar()
-        enc_db_att   = load_encodings()
-        session_date = datetime.now().strftime("%Y-%m-%d")
-        EVERY        = 5  # run recognition every N frames
-
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            st.warning("⚠️ Camera read failed. Try stopping and restarting.")
-        else:
-            frame = cv2.flip(frame, 1)
-            st.session_state.att_frame_count += 1
-            frame_count = st.session_state.att_frame_count
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            cv2.equalizeHist(gray, gray)
-            faces = detect_faces(gray, haar)
-
-            for (x, y, w, h) in faces:
-                if frame_count % EVERY != 0:
-                    draw_box(frame, x, y, w, h, "scanning…", (120, 120, 120))
-                    continue
-
-                fc = frame[y:y+h, x:x+w]
-                if fc.size == 0:
-                    continue
-
-                try:
-                    enc = get_embedding(fc)
-                    if enc is None:
-                        draw_box(frame, x, y, w, h, "?", (80, 80, 200))
-                        continue
-
-                    best_id, best_dist, best_name = None, 1.0, "Unknown"
-                    for s_id, data in enc_db_att.items():
-                        dists = [cosine(enc, e) for e in data["encodings"]]
-                        avg   = float(np.mean(sorted(dists)[:5]))
-                        if avg < best_dist:
-                            best_dist = avg
-                            best_id   = s_id
-                            best_name = data["name"]
-
-                    if best_dist < THRESHOLD:
-                        already = best_id in st.session_state.att_marked
-                        color   = (0, 180, 60) if not already else (200, 140, 0)
-                        draw_box(frame, x, y, w, h,
-                                 f"{best_name} {'(marked)' if already else 'PRESENT'}", color)
-                        if not already:
-                            now = datetime.now().strftime("%H:%M:%S")
-                            st.session_state.att_marked.add(best_id)
-                            st.session_state.att_log.append(
-                                [best_id, best_name, now, session_date, "Present"]
-                            )
-                    else:
-                        draw_box(frame, x, y, w, h,
-                                 f"Unknown ({best_dist:.2f})", (60, 60, 200))
-
-                except Exception:
-                    draw_box(frame, x, y, w, h, "error", (0, 0, 180))
-
-            hud(frame, f"Date:{session_date}  Marked:{len(st.session_state.att_marked)}  Click Stop to save")
-
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            cam_placeholder.image(rgb, channels="RGB", use_container_width=True)
-            info_placeholder.caption(f"🗓 {session_date}  |  ✅ {len(st.session_state.att_marked)} marked")
-
-            if st.session_state.att_log:
-                df_live = pd.DataFrame(
-                    st.session_state.att_log,
-                    columns=["ID", "Name", "Time", "Date", "Status"]
+                # Also offer CSV download (works even on ephemeral cloud storage)
+                csv_bytes = df_save.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    label="⬇️ Download CSV",
+                    data=csv_bytes,
+                    file_name=f"Attendance_{session_date}.csv",
+                    mime="text/csv",
                 )
-                log_placeholder.dataframe(df_live[["Name", "Time"]], use_container_width=True, hide_index=True, height=400)
-                count_placeholder.success(f"**{len(st.session_state.att_marked)} student(s) marked present**")
+        else:
+            log_placeholder.info("No attendance recorded yet. Start the camera and face the lens.")
+    else:
+        st.info("👆 Click **START** on the camera widget above to begin recognition.")
 
-        time.sleep(0.05)
-        st.rerun()
-
-    elif not st.session_state.att_running and st.session_state.att_log:
-        # Save on stop
-        session_date = datetime.now().strftime("%Y-%m-%d")
-        excel_path   = os.path.join(DIRS["attendance"], f"Attendance_{session_date}.xlsx")
-        df_save = pd.DataFrame(
-            st.session_state.att_log,
-            columns=["ID", "Name", "Time", "Date", "Status"]
-        )
-        mode = "a" if os.path.exists(excel_path) else "w"
-        kw   = {"if_sheet_exists": "replace"} if mode == "a" else {}
-        with pd.ExcelWriter(excel_path, engine="openpyxl", mode=mode, **kw) as writer:
-            df_save.to_excel(writer, sheet_name=session_date, index=False)
-
-        st.success(f"✅ Attendance saved → `{excel_path}`")
-        st.dataframe(df_save, use_container_width=True, hide_index=True)
-
-        if os.path.exists(TMP_FACE):
-            try:
-                os.remove(TMP_FACE)
-            except Exception:
-                pass
-
-        # Clear log so it doesn't re-save on next rerun
-        st.session_state.att_log    = []
-        st.session_state.att_marked = set()
 
 # ══════════════════════════════════════════════════════════════
 #  PAGE: REPORTS
@@ -681,11 +617,7 @@ elif page == "📈 Reports":
             xl     = pd.ExcelFile(sel_path)
             sheets = xl.sheet_names
 
-            if len(sheets) > 1:
-                sel_sheet = st.selectbox("📄 Select date", sheets, index=len(sheets)-1)
-            else:
-                sel_sheet = sheets[0]
-
+            sel_sheet = st.selectbox("📄 Select date", sheets, index=len(sheets)-1) if len(sheets) > 1 else sheets[0]
             df_report = xl.parse(sel_sheet)
 
             mc1, mc2, mc3 = st.columns(3)
@@ -693,7 +625,7 @@ elif page == "📈 Reports":
             if os.path.exists(STUDENTS_CSV):
                 total_reg      = len(pd.read_csv(STUDENTS_CSV))
                 attendance_pct = len(df_report) / max(total_reg, 1) * 100
-                mc2.metric("👥 Total Enrolled", total_reg)
+                mc2.metric("👥 Total Enrolled",   total_reg)
                 mc3.metric("📊 Attendance Rate", f"{attendance_pct:.1f}%")
 
             st.markdown("---")

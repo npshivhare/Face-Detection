@@ -1,4 +1,6 @@
 streamlit
+streamlit-webrtc
+av
 numpy
 pandas
 scikit-learn
@@ -7,3 +9,5 @@ joblib
 plotly
 opencv-python-headless
 openpyxl
+deepface
+tf-keras
