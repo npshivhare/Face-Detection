@@ -1,5 +1,7 @@
 streamlit
 numpy
 pandas
-opencv-python-headless
-Pillow
+scikit-learn
+scipy
+joblib
+plotly
