@@ -30,7 +30,6 @@ try:
 except ImportError:
     WEBRTC_OK = False
 
-
 # ── Import backend ────────────────────────────────────────────
 try:
     from attendance_system import (
@@ -53,6 +52,17 @@ if BACKEND_OK:
 RTC_CONFIG = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
+
+# ── Force laptop/front camera — no mobile, no rear cam ────────
+LAPTOP_CAMERA_CONSTRAINTS = {
+    "video": {
+        "facingMode": "user",       # front-facing / laptop webcam only
+        "width":  {"ideal": 640},
+        "height": {"ideal": 480},
+        "frameRate": {"ideal": 15},
+    },
+    "audio": False,
+}
 
 # ══════════════════════════════════════════════════════════════
 #  CSS STYLING
@@ -183,8 +193,8 @@ class AttendanceProcessor(VideoProcessorBase):
     def __init__(self):
         self.lock        = threading.Lock()
         self.enc_db      = load_encodings()
-        self.marked      = set()   # set of student IDs already marked
-        self.log         = []      # list of [id, name, time, date, status]
+        self.marked      = set()
+        self.log         = []
         self._haar       = get_haar() if BACKEND_OK else None
         self._frame_no   = 0
         self._threshold  = THRESHOLD if BACKEND_OK else 0.4
@@ -199,7 +209,6 @@ class AttendanceProcessor(VideoProcessorBase):
         faces = detect_faces(gray, self._haar) if BACKEND_OK else []
 
         for (x, y, w, h) in (faces if faces is not None else []):
-            # Only run heavy recognition every 5 frames
             if self._frame_no % 5 != 0:
                 if BACKEND_OK:
                     draw_box(img, x, y, w, h, "scanning…", (120, 120, 120))
@@ -234,7 +243,7 @@ class AttendanceProcessor(VideoProcessorBase):
                     if BACKEND_OK:
                         draw_box(img, x, y, w, h, label, color)
                     if not already:
-                        now = datetime.now().strftime("%H:%M:%S")
+                        now  = datetime.now().strftime("%H:%M:%S")
                         date = datetime.now().strftime("%Y-%m-%d")
                         with self.lock:
                             self.marked.add(best_id)
@@ -345,22 +354,22 @@ elif page == "👤 Register":
             student_dir = ""
 
         st.markdown("---")
-        st.markdown("**Step 1 — Allow camera access, then position your face**")
-        st.markdown("**Step 2 — Click *Start Capturing* below**")
+        st.info("📷 Allow camera access when prompted — your **laptop webcam** will be used.")
+        st.markdown("**Step 1 — Click START and allow camera permission**")
+        st.markdown("**Step 2 — Position your face, then click *Start Capturing***")
 
+        # ── Register streamer: forces laptop webcam ───────────
         ctx = webrtc_streamer(
             key="register",
             video_processor_factory=RegisterProcessor,
             rtc_configuration=RTC_CONFIG,
-            media_stream_constraints={"video": True, "audio": False},
+            media_stream_constraints=LAPTOP_CAMERA_CONSTRAINTS,
             async_processing=True,
         )
 
-        # Wire student_dir into the processor as soon as it exists
         if ctx.video_processor and student_dir:
             ctx.video_processor.student_dir = student_dir
 
-        # Controls
         col_a, col_b = st.columns(2)
         start_btn  = col_a.button("🟢 Start Capturing", type="primary", use_container_width=True)
         stop_btn   = col_b.button("⏹ Stop",              use_container_width=True)
@@ -380,7 +389,6 @@ elif page == "👤 Register":
         if stop_btn and ctx.video_processor:
             ctx.video_processor.capturing = False
 
-        # Live progress
         if ctx.video_processor:
             saved  = ctx.video_processor.saved
             target = ctx.video_processor.target
@@ -388,7 +396,6 @@ elif page == "👤 Register":
             st.caption(f"Frames captured: {saved} / {target}")
 
             if saved >= target and student_dir:
-                # Auto-save student to CSV
                 new_row = pd.DataFrame(
                     [[int(sid.strip()), name.strip(), datetime.now().strftime("%Y-%m-%d %H:%M")]],
                     columns=["ID", "Name", "Registered"],
@@ -410,13 +417,15 @@ elif page == "👤 Register":
         st.markdown("""
 **Registration Steps:**
 1. Enter Student ID (numeric) and Name
-2. Click **Start** on the camera widget (allow browser camera access)
-3. Click **Start Capturing** once your face is visible
-4. Hold still — frames are captured automatically
-5. Registration saves when target frames are reached
+2. Click **START** on the camera widget
+3. When the browser asks for camera permission — click **Allow**
+4. Your laptop webcam will activate automatically
+5. Click **Start Capturing** once your face is visible
+6. Hold still — 30 frames are captured automatically
 
 **Tips for Best Results:**
-- Ensure good lighting
+- Sit in front of your **laptop**, not your phone
+- Ensure good lighting on your face
 - Face the camera directly
 - Stay still during capture
 - Remove glasses if possible
@@ -545,12 +554,14 @@ elif page == "📋 Attendance":
     col_cam, col_log = st.columns([3, 2])
 
     with col_cam:
-        st.markdown("**Allow camera access and click Start ▶**")
+        st.info("📷 Click **START** below and allow camera permission — your laptop webcam will be used.")
+
+        # ── Attendance streamer: forces laptop webcam ──────────
         ctx = webrtc_streamer(
             key="attendance",
             video_processor_factory=AttendanceProcessor,
             rtc_configuration=RTC_CONFIG,
-            media_stream_constraints={"video": True, "audio": False},
+            media_stream_constraints=LAPTOP_CAMERA_CONSTRAINTS,
             async_processing=True,
         )
 
@@ -560,11 +571,10 @@ elif page == "📋 Attendance":
         count_placeholder = st.empty()
         save_placeholder  = st.empty()
 
-    # Poll the processor state every refresh
     if ctx.video_processor:
         with ctx.video_processor.lock:
-            log_snapshot    = list(ctx.video_processor.log)
-            marked_count    = len(ctx.video_processor.marked)
+            log_snapshot = list(ctx.video_processor.log)
+            marked_count = len(ctx.video_processor.marked)
 
         if log_snapshot:
             df_live = pd.DataFrame(log_snapshot, columns=["ID", "Name", "Time", "Date", "Status"])
@@ -573,7 +583,6 @@ elif page == "📋 Attendance":
             )
             count_placeholder.success(f"**{marked_count} student(s) marked present**")
 
-            # Save button
             if save_placeholder.button("💾 Save Attendance to Excel", type="primary"):
                 session_date = datetime.now().strftime("%Y-%m-%d")
                 excel_path   = os.path.join(DIRS["attendance"], f"Attendance_{session_date}.xlsx")
@@ -584,7 +593,6 @@ elif page == "📋 Attendance":
                     df_save.to_excel(writer, sheet_name=session_date, index=False)
                 st.success(f"✅ Saved → `{excel_path}`")
 
-                # Also offer CSV download (works even on ephemeral cloud storage)
                 csv_bytes = df_save.to_csv(index=False).encode("utf-8")
                 st.download_button(
                     label="⬇️ Download CSV",
