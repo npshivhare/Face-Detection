@@ -5,3 +5,4 @@ scikit-learn
 scipy
 joblib
 plotly
+opencv-python-headless
