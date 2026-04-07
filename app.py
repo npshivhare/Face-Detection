@@ -30,6 +30,18 @@ try:
 except ImportError:
     WEBRTC_OK = False
 
+
+from streamlit_webrtc import webrtc_streamer, RTCConfiguration
+
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
+
+webrtc_streamer(
+    key="camera",
+    rtc_configuration=RTC_CONFIGURATION
+)
+
 # ── Import backend ────────────────────────────────────────────
 try:
     from attendance_system import (
