@@ -3,6 +3,16 @@ Facial Recognition Attendance System — Streamlit GUI  (FIXED)
 Requires: attendance_system.py in the same directory
 Run     : streamlit run app.py
 """
+import sys
+import streamlit as st
+
+st.write("Python:", sys.executable)
+
+try:
+    import openpyxl
+    st.write("openpyxl OK:", openpyxl.__version__)
+except Exception as e:
+    st.error(f"openpyxl import failed: {e}")
 
 import os, cv2, pickle, warnings, glob, time
 import numpy as np
@@ -269,11 +279,12 @@ elif page == "👤 Register":
                     gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     cv2.equalizeHist(gray, gray)
                     faces = detect_faces(gray, haar)
-                    for (x, y, w, h) in faces:
-                        draw_box(frame, x, y, w, h, "Face Detected ✓", (0, 220, 220))
-                    if not faces:
+
+                    if faces is None or len(faces) == 0:
                         hud(frame, "No face detected — adjust position", color=(0, 100, 220))
                     else:
+                        for (x, y, w, h) in faces:
+                            draw_box(frame, x, y, w, h, "Face Detected ✓", (0, 220, 220))
                         hud(frame, f"{len(faces)} face(s) detected — click Start Capturing")
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     cam_placeholder.image(rgb, channels="RGB", use_container_width=True)
@@ -302,7 +313,10 @@ elif page == "👤 Register":
 
                     # Save frame to disk
                     save_path = os.path.join(student_dir, f"{saved}.jpg")
-                    cv2.imwrite(save_path, frame)
+                    if faces is not None and len(faces) > 0:
+                        x, y, w, h = faces[0]   # take first face
+                        face_crop = frame[y:y+h, x:x+w]
+                        cv2.imwrite(save_path, face_crop)
                     st.session_state.reg_saved += 1
                     saved = st.session_state.reg_saved
 
