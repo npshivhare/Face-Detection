@@ -182,6 +182,16 @@ elif page == "👤 Register":
     st.markdown('<p class="section-title">Register Student</p>', unsafe_allow_html=True)
     st.markdown('<p class="section-sub">Capture facial data and enroll new students</p>', unsafe_allow_html=True)
 
+    # Request rear camera early so browser warms up the stream
+    st.markdown("""
+    <script>
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
+            .catch(function(e) { console.warn("Camera pre-warm failed:", e); });
+    }
+    </script>
+    """, unsafe_allow_html=True)
+
     # Session state
     for k, v in [("reg_saved_frames", []), ("reg_done", False)]:
         if k not in st.session_state:
@@ -197,9 +207,6 @@ elif page == "👤 Register":
         st.markdown("#### 📸 Camera Capture")
         st.info("👇 Click **Take Photo** — browser asks for camera permission on **this device** only.")
 
-        # ── KEY WIDGET ────────────────────────────────────────
-        # st.camera_input opens the device's own webcam directly.
-        # No WebRTC, no STUN/TURN — pure browser camera API.
         photo = st.camera_input(
             label="Take a photo",
             key="reg_camera",
@@ -358,7 +365,8 @@ elif page == "🧠 Train Model":
                     logs.append(f"  ❌ No embeddings for {f_name}\n")
 
                 progress_bar.progress((idx + 1) / len(folders))
-                log_area.text_area("Training Log", "\n".join(logs[-20:]), height=300)
+                # FIX: unique key per iteration prevents StreamlitDuplicateElementId
+                log_area.text_area("Training Log", "\n".join(logs[-20:]), height=300, key=f"log_{idx}")
 
             if not encodings_db:
                 st.error("❌ Training failed — no encodings created.")
@@ -391,6 +399,16 @@ elif page == "📋 Attendance":
     if not os.path.exists(ENCODINGS_PKL):
         st.error("❌ No trained model found. Please train the model first.")
         st.stop()
+
+    # Request rear camera early so browser warms up the stream
+    st.markdown("""
+    <script>
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
+            .catch(function(e) { console.warn("Camera pre-warm failed:", e); });
+    }
+    </script>
+    """, unsafe_allow_html=True)
 
     enc_db_att   = load_encodings()
     session_date = datetime.now().strftime("%Y-%m-%d")
@@ -495,7 +513,6 @@ elif page == "📋 Attendance":
                     df_save.to_excel(writer, sheet_name=session_date, index=False)
                 st.success(f"✅ Saved to `{excel_path}`")
 
-            # CSV download always available (works on ephemeral cloud storage)
             df_dl = pd.DataFrame(st.session_state.att_log,
                                  columns=["ID","Name","Time","Date","Status"])
             st.download_button(
