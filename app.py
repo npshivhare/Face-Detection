@@ -3,9 +3,15 @@ Facial Recognition Attendance System — Streamlit Cloud Edition
 Uses st.camera_input() — works on any device, no WebRTC/TURN servers needed.
 Requires: attendance_system.py in the same directory
 Run     : streamlit run app.py
+
+FIXES:
+  1. Auto-capture: Registration page captures 30 frames automatically using
+     st.session_state + st.rerun() loop — no manual clicking needed.
+  2. Better recognition: Uses MEDIAN instead of mean of top-5, applies a
+     stricter per-embedding vote (majority-vote), and tightened THRESHOLD.
 """
 
-import os, cv2, pickle, warnings, glob
+import os, cv2, pickle, warnings, glob, time
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -36,6 +42,11 @@ try:
 except ImportError as _e:
     BACKEND_OK = False
     BACKEND_ERR = str(_e)
+
+# ── Tighter threshold for recognition (override backend value) ─
+# Lower = stricter match. 0.35 is a good starting point for Facenet.
+# If you get too many "Unknown" results, raise to 0.40.
+RECOGNITION_THRESHOLD = 0.35
 
 if BACKEND_OK:
     for p in DIRS.values():
@@ -103,12 +114,10 @@ def attendance_files():
     return sorted(glob.glob(os.path.join(DIRS["attendance"], "*.xlsx")))
 
 def pil_to_bgr(pil_img):
-    """Convert PIL image from camera_input to OpenCV BGR array."""
     rgb = np.array(pil_img.convert("RGB"))
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
 def detect_and_draw(bgr, haar, label="", color=(0, 220, 220)):
-    """Run face detection, draw boxes, return (frame_rgb, faces)."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     cv2.equalizeHist(gray, gray)
     faces = detect_faces(gray, haar)
@@ -117,6 +126,45 @@ def detect_and_draw(bgr, haar, label="", color=(0, 220, 220)):
         draw_box(out, x, y, w, h, label, color)
     rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
     return rgb, faces if faces is not None else []
+
+# ── FIX 2: Better recognition using median + majority vote ────
+def identify_face(enc, enc_db):
+    """
+    Returns (student_id, name, distance) for best match, or (None, 'Unknown', 1.0).
+
+    Strategy:
+      - For each enrolled student, compute cosine distance to ALL their embeddings.
+      - Count how many embeddings are below RECOGNITION_THRESHOLD (votes).
+      - Pick the student with the most votes AND lowest median distance.
+      - Require at least 30% of their embeddings to vote (avoids flukes).
+    """
+    best_id, best_name, best_dist = None, "Unknown", 1.0
+    best_votes = 0
+
+    for s_id, data in enc_db.items():
+        stored = data["encodings"]
+        dists  = [cosine(enc, e) for e in stored]
+        votes  = sum(1 for d in dists if d < RECOGNITION_THRESHOLD)
+        med    = float(np.median(dists))
+
+        vote_ratio = votes / len(stored) if stored else 0
+
+        # Must win on votes AND have >30% of embeddings agree
+        if votes > best_votes and vote_ratio >= 0.30:
+            best_votes = votes
+            best_id    = s_id
+            best_name  = data["name"]
+            best_dist  = med
+        elif votes == best_votes and med < best_dist and vote_ratio >= 0.30:
+            best_id   = s_id
+            best_name = data["name"]
+            best_dist = med
+
+    # Final gate: median distance must also be below threshold
+    if best_id is not None and best_dist >= RECOGNITION_THRESHOLD:
+        return None, "Unknown", best_dist
+
+    return best_id, best_name, best_dist
 
 # ══════════════════════════════════════════════════════════════
 #  SIDEBAR
@@ -176,79 +224,107 @@ if page == "📊 Dashboard":
 
 
 # ══════════════════════════════════════════════════════════════
-#  PAGE: REGISTER  —  uses st.camera_input()
+#  PAGE: REGISTER  —  AUTO-CAPTURE 30 FRAMES
 # ══════════════════════════════════════════════════════════════
 elif page == "👤 Register":
     st.markdown('<p class="section-title">Register Student</p>', unsafe_allow_html=True)
-    st.markdown('<p class="section-sub">Capture facial data and enroll new students</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-sub">Auto-capture 30 frames for facial enrollment</p>', unsafe_allow_html=True)
 
-    # Request rear camera early so browser warms up the stream
-    st.markdown("""
-    <script>
-    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
-            .catch(function(e) { console.warn("Camera pre-warm failed:", e); });
-    }
-    </script>
-    """, unsafe_allow_html=True)
-
-    # Session state
-    for k, v in [("reg_saved_frames", []), ("reg_done", False)]:
+    # ── Session state init ────────────────────────────────────
+    for k, v in [
+        ("reg_saved_frames", []),
+        ("reg_done", False),
+        ("reg_capturing", False),   # NEW: auto-capture loop flag
+    ]:
         if k not in st.session_state:
             st.session_state[k] = v
 
     col_form, col_info = st.columns([1, 1])
 
     with col_form:
-        sid  = st.text_input("🆔 Student ID (numeric)", placeholder="e.g. 1001")
-        name = st.text_input("📝 Student Name",         placeholder="e.g. John Doe")
+        # Disable fields while capturing
+        capturing = st.session_state.reg_capturing
+        sid  = st.text_input("🆔 Student ID (numeric)", placeholder="e.g. 1001", disabled=capturing)
+        name = st.text_input("📝 Student Name",         placeholder="e.g. John Doe",  disabled=capturing)
 
         st.markdown("---")
-        st.markdown("#### 📸 Camera Capture")
-        st.info("👇 Click **Take Photo** — browser asks for camera permission on **this device** only.")
+        st.markdown("#### 📸 Auto-Capture")
 
-        photo = st.camera_input(
-            label="Take a photo",
-            key="reg_camera",
-            help="Click to capture one frame. Repeat to collect multiple samples.",
+        saved_count = len(st.session_state.reg_saved_frames)
+        progress_placeholder = st.empty()
+        progress_placeholder.progress(min(saved_count / CAPTURE_FRAMES, 1.0))
+        caption_placeholder  = st.empty()
+        caption_placeholder.caption(f"Frames captured: {saved_count} / {CAPTURE_FRAMES}")
+
+        # ── Camera widget (always visible) ───────────────────
+        # key changes each frame during auto-capture to force a fresh snapshot
+        cam_key = f"reg_cam_{saved_count}" if capturing else "reg_cam_idle"
+        photo   = st.camera_input(
+            label="Camera feed",
+            key=cam_key,
+            help="Click 'Start Auto-Capture' below — frames are collected automatically.",
         )
 
         haar = get_haar()
 
-        if photo is not None:
-            if not sid.strip().isdigit():
-                st.error("❌ Student ID must be numeric.")
-            elif not name.strip():
-                st.error("❌ Name cannot be empty.")
+        # ── Process the latest photo if auto-capture is running ──
+        if capturing and photo is not None and saved_count < CAPTURE_FRAMES:
+            pil_img  = Image.open(io.BytesIO(photo.getvalue()))
+            bgr      = pil_to_bgr(pil_img)
+            gray     = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            cv2.equalizeHist(gray, gray)
+            faces    = detect_faces(gray, haar)
+
+            if faces is not None and len(faces) > 0:
+                x, y, w, h = faces[0]
+                face_crop  = bgr[y:y+h, x:x+w]
+                st.session_state.reg_saved_frames.append(face_crop)
+                saved_count = len(st.session_state.reg_saved_frames)
+                progress_placeholder.progress(min(saved_count / CAPTURE_FRAMES, 1.0))
+                caption_placeholder.caption(f"Frames captured: {saved_count} / {CAPTURE_FRAMES}")
+
+            # Stop if we've hit the target
+            if saved_count >= CAPTURE_FRAMES:
+                st.session_state.reg_capturing = False
+                st.success(f"✅ Auto-capture complete! {saved_count} frames collected.")
             else:
-                pil_img = Image.open(io.BytesIO(photo.getvalue()))
-                bgr     = pil_to_bgr(pil_img)
+                # Small delay then rerun to grab the next frame
+                time.sleep(0.15)
+                st.rerun()
 
-                rgb_out, faces = detect_and_draw(bgr, haar, "Face Detected ✓", (0, 220, 220))
-                st.image(rgb_out, channels="RGB", use_container_width=True)
+        # ── Control buttons ───────────────────────────────────
+        col_start, col_clear = st.columns(2)
 
-                if len(faces) == 0:
-                    st.warning("⚠️ No face detected — try better lighting or move closer.")
+        # START button — only show when not capturing and not done
+        if not capturing and saved_count < CAPTURE_FRAMES:
+            if col_start.button("▶️ Start Auto-Capture", type="primary", use_container_width=True):
+                if not sid.strip().isdigit():
+                    st.error("❌ Student ID must be numeric.")
+                elif not name.strip():
+                    st.error("❌ Name cannot be empty.")
                 else:
-                    x, y, w, h = faces[0]
-                    face_crop  = bgr[y:y+h, x:x+w]
-                    st.session_state.reg_saved_frames.append(face_crop)
-                    st.success(f"✅ Frame {len(st.session_state.reg_saved_frames)}/{CAPTURE_FRAMES} captured!")
+                    st.session_state.reg_capturing     = True
+                    st.session_state.reg_saved_frames  = []
+                    st.rerun()
 
-        saved_count = len(st.session_state.reg_saved_frames)
-        st.progress(min(saved_count / CAPTURE_FRAMES, 1.0))
-        st.caption(f"Frames captured: {saved_count} / {CAPTURE_FRAMES}  (min 5 to save)")
+        # STOP button — only show while capturing
+        if capturing:
+            if col_start.button("⏹ Stop", use_container_width=True):
+                st.session_state.reg_capturing = False
+                st.rerun()
 
-        col_a, col_b = st.columns(2)
-
-        if col_b.button("🗑 Clear & Restart", use_container_width=True):
+        if col_clear.button("🗑 Clear & Restart", use_container_width=True):
             st.session_state.reg_saved_frames = []
             st.session_state.reg_done         = False
+            st.session_state.reg_capturing    = False
             st.rerun()
 
-        save_ready = saved_count >= max(5, CAPTURE_FRAMES // 3)
-        if col_a.button("💾 Save Registration", type="primary",
-                        use_container_width=True, disabled=not save_ready):
+        st.markdown("---")
+
+        # SAVE button — enabled once ≥ 5 frames collected
+        save_ready = saved_count >= max(5, CAPTURE_FRAMES // 3) and not capturing
+        if st.button("💾 Save Registration", type="primary",
+                     use_container_width=True, disabled=not save_ready):
             if not sid.strip().isdigit():
                 st.error("❌ Student ID must be numeric.")
             elif not name.strip():
@@ -282,16 +358,17 @@ elif page == "👤 Register":
         st.markdown("""
 **Steps:**
 1. Enter Student ID and Name
-2. Click **Take Photo** — browser asks for camera on **this device**
-3. Keep clicking to capture multiple frames (aim for 10–30)
-4. Good frames show a teal detection box ✓
-5. Click **Save Registration** when done (min 5 frames)
+2. Sit in front of the camera with good lighting
+3. Click **▶️ Start Auto-Capture** — 30 frames are taken automatically
+4. Slightly move your head during capture for variety
+5. Click **💾 Save Registration** when done
 
-**Tips:**
-- Each click = 1 frame saved
-- Slightly change head angle between shots for variety
-- Good lighting = better accuracy later
+**Tips for better accuracy:**
+- Use consistent, even lighting (avoid backlight from windows)
+- Look slightly left, right, up, down during capture
 - Remove glasses if possible
+- Capture ≥ 30 frames per person
+- **Re-register** if recognition is poor — more diverse frames = better model
         """)
 
         if not df_stu.empty:
@@ -354,18 +431,16 @@ elif page == "🧠 Train Model":
                         enc = get_embedding(bgr)
                         if enc is not None:
                             enc_list.append(enc)
-                            logs.append(f"  ✓ {img_file}")
                     except Exception as e:
                         logs.append(f"  ⚠️ {img_file}: {e}")
 
                 if enc_list:
                     encodings_db[sid] = {"name": f_name, "encodings": enc_list}
-                    logs.append(f"  ✅ {len(enc_list)} embeddings saved\n")
+                    logs.append(f"  ✅ {len(enc_list)} embeddings saved for {f_name}\n")
                 else:
                     logs.append(f"  ❌ No embeddings for {f_name}\n")
 
                 progress_bar.progress((idx + 1) / len(folders))
-                # FIX: unique key per iteration prevents StreamlitDuplicateElementId
                 log_area.text_area("Training Log", "\n".join(logs[-20:]), height=300, key=f"log_{idx}")
 
             if not encodings_db:
@@ -384,13 +459,13 @@ elif page == "🧠 Train Model":
     st.markdown("---")
     st.markdown("""
 **What happens during training?**
-Face detection on registered images → Facenet embeddings (128-D) → saved for live recognition.
+Face detection → Facenet 128-D embeddings → saved for live recognition.
 Retrain after registering new students. First run downloads Facenet model (~90 MB).
     """)
 
 
 # ══════════════════════════════════════════════════════════════
-#  PAGE: ATTENDANCE  —  uses st.camera_input()
+#  PAGE: ATTENDANCE  —  improved recognition
 # ══════════════════════════════════════════════════════════════
 elif page == "📋 Attendance":
     st.markdown('<p class="section-title">Mark Attendance</p>', unsafe_allow_html=True)
@@ -399,16 +474,6 @@ elif page == "📋 Attendance":
     if not os.path.exists(ENCODINGS_PKL):
         st.error("❌ No trained model found. Please train the model first.")
         st.stop()
-
-    # Request rear camera early so browser warms up the stream
-    st.markdown("""
-    <script>
-    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
-            .catch(function(e) { console.warn("Camera pre-warm failed:", e); });
-    }
-    </script>
-    """, unsafe_allow_html=True)
 
     enc_db_att   = load_encodings()
     session_date = datetime.now().strftime("%Y-%m-%d")
@@ -422,10 +487,13 @@ elif page == "📋 Attendance":
     with col_cam:
         st.info("📷 Click **Take Photo** to recognise the student in front of the camera.")
 
+        # Show current threshold for transparency
+        st.caption(f"Recognition threshold: {RECOGNITION_THRESHOLD} (lower = stricter)")
+
         photo = st.camera_input(
             label="Take attendance photo",
             key="att_camera",
-            help="Point the camera at student(s) and click to capture.",
+            help="Point camera at student and click.",
         )
 
         if photo is not None:
@@ -451,16 +519,10 @@ elif page == "📋 Attendance":
                             draw_box(out, x, y, w, h, "?", (80, 80, 200))
                             continue
 
-                        best_id, best_dist, best_name = None, 1.0, "Unknown"
-                        for s_id, data in enc_db_att.items():
-                            dists = [cosine(enc, e) for e in data["encodings"]]
-                            avg   = float(np.mean(sorted(dists)[:5]))
-                            if avg < best_dist:
-                                best_dist = avg
-                                best_id   = s_id
-                                best_name = data["name"]
+                        # ── FIX 2: use improved identify_face() ──────────
+                        best_id, best_name, best_dist = identify_face(enc, enc_db_att)
 
-                        if best_dist < THRESHOLD:
+                        if best_id is not None:
                             already = best_id in st.session_state.att_marked
                             color   = (200, 140, 0) if already else (0, 200, 60)
                             label   = f"{best_name} ({'marked' if already else 'PRESENT'})"
@@ -471,15 +533,16 @@ elif page == "📋 Attendance":
                                 st.session_state.att_log.append(
                                     [best_id, best_name, now, session_date, "Present"]
                                 )
-                                results.append(f"✅ **{best_name}** marked present")
+                                results.append(f"✅ **{best_name}** marked present (score: {best_dist:.3f})")
                             else:
                                 results.append(f"🔁 **{best_name}** already marked")
                         else:
                             draw_box(out, x, y, w, h, f"Unknown ({best_dist:.2f})", (60, 60, 200))
-                            results.append(f"❓ Unknown face (score: {best_dist:.2f})")
+                            results.append(f"❓ Unknown face (best score: {best_dist:.3f}) — not confident enough")
 
-                    except Exception:
+                    except Exception as ex:
                         draw_box(out, x, y, w, h, "error", (0, 0, 180))
+                        results.append(f"⚠️ Error: {ex}")
 
                 rgb_out = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
                 st.image(rgb_out, channels="RGB", use_container_width=True)
