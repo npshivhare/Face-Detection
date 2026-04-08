@@ -4,9 +4,7 @@ A real-time face recognition-based attendance system leveraging a **pre-trained 
 
 🚀 **Live App:** https://face-detection-84kwe6szpukadkp4o2tjyt.streamlit.app
 
-📂 **GitHub Repo:** https://github.com/npshivhare/Face-Detection  
-
-🎥 **Demo Video:** [Add YouTube Link]
+📂 **GitHub Repo:** https://github.com/npshivhare/Face-Detection
 
 ---
 
